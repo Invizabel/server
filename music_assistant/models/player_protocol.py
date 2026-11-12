@@ -141,6 +141,9 @@ class PlayerProtocol(ABC):
     _attr_setup_reason: str | None = None
     _attr_supported_sample_rates: list[tuple[int, int]] | None = None
     _attr_underlying_protocol_id: str | None = None
+    # Identifiers of further devices whose protocols belong to the player of this protocol,
+    # such as the renderers of the other speakers of a room; see claimed_identifiers.
+    _attr_claimed_identifiers: frozenset[tuple[IdentifierType, str]] = frozenset()
     # Seconds an external source may sit paused before its session is considered ended.
     # Set this on players whose device keeps a source such as Spotify Connect loaded and
     # paused after the app released it, offering nothing that tells an abandoned session
@@ -1287,6 +1290,18 @@ class PlayerProtocol(ABC):
         rides on instead of being matched by its device identifiers.
         """
         return self._attr_underlying_protocol_id
+
+    @property
+    @final
+    def claimed_identifiers(self) -> frozenset[tuple[IdentifierType, str]]:
+        """
+        Return identifiers of further devices whose protocols belong to the player of this one.
+
+        A protocol of such a device attaches to the player as a claimed instance, also next
+        to a protocol of its own domain: it is no output and no control of the player, and it
+        follows this protocol. Attach the protocol again when its claims change.
+        """
+        return self._attr_claimed_identifiers
 
     @final
     def update_state(self, force_update: bool = False, signal_event: bool = True) -> None:

@@ -423,8 +423,10 @@ async def test_player_configs_lists_the_settings_page(scenario: Scenario) -> Non
     ]
 
 
-async def test_identifier_list_reports_every_value(scenario: Scenario) -> None:
-    """A list of identifier values is reported value by value, an empty one drops the identifier."""
+async def test_identifier_list_reports_the_first_value_and_claims_the_others(
+    scenario: Scenario,
+) -> None:
+    """A list of identifier values reports its first one and claims the others; an empty one drops it."""
     sonos = await scenario.add_provider("sonos")
     identifiers: dict[IdentifierType, str | list[str]] = {
         IdentifierType.UUID: ["RINCON_A", "RINCON_B"],
@@ -442,17 +444,20 @@ async def test_identifier_list_reports_every_value(scenario: Scenario) -> None:
         DeviceInfo, "add_identifier", autospec=True, side_effect=DeviceInfo.add_identifier
     ) as add_identifier:
         speaker = sonos.protocol("RINCON_KITCHEN", "Kitchen", identifiers=identifiers)
-        assert _uuids_reported_to(speaker.device_info, add_identifier) == ["RINCON_A", "RINCON_B"]
+        assert _uuids_reported_to(speaker.device_info, add_identifier) == ["RINCON_A"]
+        assert speaker.claimed_identifiers == {(IdentifierType.UUID, "RINCON_B")}
         await scenario.attach(speaker)
         await scenario.restart()
         restored = scenario.protocol("RINCON_KITCHEN")
-        assert _uuids_reported_to(restored.device_info, add_identifier) == ["RINCON_A", "RINCON_B"]
+        assert _uuids_reported_to(restored.device_info, add_identifier) == ["RINCON_A"]
+        assert restored.claimed_identifiers == {(IdentifierType.UUID, "RINCON_B")}
 
     await scenario.report(restored, identifiers={IdentifierType.UUID: []})
     await scenario.restart()
 
     assert IdentifierType.UUID not in restored.device_info.identifiers
     assert IdentifierType.UUID not in scenario.protocol("RINCON_KITCHEN").device_info.identifiers
+    assert restored.claimed_identifiers == frozenset()
 
 
 async def test_player_config_only_misses_an_unstored_player(scenario: Scenario) -> None:

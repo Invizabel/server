@@ -130,9 +130,9 @@ protocols name the kept player. A name, a setting, DSP or queue settings only th
 has are kept; where both have one, the kept player's stays. The queue of the player that goes is
 dropped, and stopped first when it plays its own queue; what it plays for a group or a sync leader
 plays on, for the kept player. The attach rules decide whether two players can be one: not when
-both have a protocol that stands for the device, or a protocol of the same domain, when a strong
-identifier of one rules the other out, and never for a group or a player that only exists while
-connected. What is stored changes in one step, right after that check, and is saved before
+both have a protocol that stands for the device of one rank, or a protocol of the same domain (a
+claimed instance is none), when a strong identifier of one rules the other out, and never for a
+group or a player that only exists while connected. What is stored changes in one step, right after that check, and is saved before
 anything else of the player that goes is deleted, so after a crash either both players are as
 they were or the merge is stored. The user filters are rewritten once the removal of the player
 that goes reached the users limited to it; a crash in between leaves such a user limited to an id
@@ -157,7 +157,7 @@ its id, name, settings and queue, and its output and control choices that named 
 back to their default: the identity stays with the protocols that stay, whichever role the one
 taken off has, so without its own protocol the old player is a player of its audio protocols. A
 protocol that rides on another, the protocol of a group, a protocol that only exists while
-connected and the only protocol of a player are not taken off.
+connected, a claimed instance and the only protocol of a player are not taken off.
 
 ## Legacy Ids
 
@@ -254,10 +254,20 @@ other one stands for the device again while the user has the better one's provid
 better one switched off, and once the better one is removed (its provider forgets the device, or is
 removed). Two of one rank, such as the Squeezelite and Snapcast clients of one host, are two players.
 
+A protocol can stand for further devices: a Raumfeld room for the renderers of its other speakers.
+It reports their identifiers (`claimed_identifiers`), and a protocol of such a device is a claimed
+instance of its player: it attaches to it in the control role, also next to a protocol of its own
+domain, with the same reservation (no command, no output, not what makes the player available).
+The claims of the attached own protocol decide. While that protocol is away and switched on, an
+attached claimed instance stays one, and the protocols of a domain the player holds several of
+wait for it, so the claims tell which of them is claimed. When the claim ends (the own protocol
+claims it no more, is switched off or removed) the instance attaches as what it is without the
+claim, a player of its own or the claimed instance of another player.
+
 A role is fixed while the protocol is attached; a protocol that reports another role, or that
-attaches in another one because a protocol that ranks above it arrived or was removed, is
-detached and attached again, to the same player when it still has a place for it, else to a
-player of its own.
+attaches in another one because a protocol that ranks above it, or one that claims it, arrived
+or was removed, is detached and attached again, to the same player when it still has a place for
+it, else to a player of its own.
 
 ## Finding the Player of a Protocol
 
@@ -309,10 +319,11 @@ Every veto is checked before any shared value may match, so two sides that diffe
 - A zone tells the outputs of one chassis apart, which share its MAC address and IP. It identifies nothing on its own, as every chassis has a first zone. A side that reports no zone is in the main zone (`MAIN_ZONE`) when a player is chosen for it, so the AirPlay or DLNA receiver of an AV receiver lands on its main zone and never on another one; a protocol that was attached to another zone before stays there. A chassis whose every zone has a receiver of its own (a BluOS multi-zone streamer) can not tell those receivers apart: the first one seen joins the main zone, the others are players of their own, never outputs of a wrong zone.
 - A MAC address never vetoes, as a device has one per network interface. Null and broadcast addresses identify nothing, and the locally-administered bit is ignored because some protocols report the hardware address with that bit set.
 - A shared IP address alone is the last resort. It never ties two native devices that each have a hardware MAC address, as one host can carry several of them.
+- A value a side claims for a further device matches like its own identifiers, and for a veto it counts in the domain of the side that holds it, so it never rules out the device it claims; a claimed instance itself is no part of the identity of its player. The protocol that attaches is matched on its own identifiers, so a room joins the player of its own renderer.
 
 A provider reports an identifier in the form the other protocols of the device report it: the DLNA provider strips the `_MR` suffix from the UDN of a Sonos renderer, which leaves the UUID of its Sonos player.
 
-**Important:** A player never holds two protocols of the same domain. Software players of one
+**Important:** A player never holds two protocols of the same domain, except claimed instances. Software players of one
 provider on one host (Snapcast clients, Squeezelite instances, Sendspin software clients) are
 separate players, not protocols of one device; their provider reports an identifier of its own
 instance (`UUID` or `SERIAL_NUMBER`), which vetoes within the domain.

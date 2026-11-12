@@ -18,6 +18,7 @@ import secrets
 import time
 from contextlib import suppress
 from copy import deepcopy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import (
@@ -57,6 +58,7 @@ from music_assistant.constants import (
 from music_assistant.controllers.config.constants import AUTOMATIC_VALUE_KEYS, GROUP_MEMBER_KEYS
 from music_assistant.controllers.players.matching import (
     DeviceIdentity,
+    Identifier,
     has_hardware_mac,
     matches_device,
     vetoes_device,
@@ -126,6 +128,8 @@ class ProtocolLinkingMixin:
         def wants_protocol(self, protocol_id: str) -> bool: ...  # noqa: D102
 
         async def _run_attach(self, protocol: PlayerProtocol, final: bool = False) -> None: ...
+
+        async def _unbind(self, protocol: PlayerProtocol) -> Player | None: ...
 
         def _get_player_id_of_protocol(self, protocol_id: str) -> str | None: ...
 
@@ -229,8 +233,9 @@ class ProtocolLinkingMixin:
         Return whether the attach rules allow a protocol on a player.
 
         A player has at most one protocol per domain, and two protocols that stand for the
-        device itself only when one ranks above the other (see _attach_role); no identifier
-        of its device may rule the protocol out. A player that only exists while its device
+        device itself only when one ranks above the other (see _attach_role), except for a
+        protocol its own protocol claims (see _is_claimed); no identifier of its device may
+        rule the protocol out. A player that only exists while its device
         is connected takes only such a protocol, and such a protocol only such a player.
         Nothing attaches to a player that is being removed.
 
@@ -254,7 +259,8 @@ class ProtocolLinkingMixin:
             # only its own protocol belongs to a group player
             return False
         protocol_id = protocol.protocol_id
-        if self._has_other_protocol_of_domain(protocol, player_id):
+        claimed = self._is_claimed(protocol, player_id)
+        if not claimed and self._has_other_protocol_of_domain(protocol, player_id):
             return False
         for other_id in self._get_protocol_ids(player_id):
             if other_id == protocol_id:
@@ -262,7 +268,7 @@ class ProtocolLinkingMixin:
             other = self._protocols.get(other_id)
             other_record = self.mass.config.get_protocol_record(other_id) or {}
             other_provider = other.provider_id if other else str(other_record.get("provider"))
-            other_role = player.get_role(other_id) if player and other else other_record.get("role")
+            other_role = other.role if other else other_record.get("role")
             if other is None and attached_only:
                 continue
             # a protocol that is away makes room for the one its provider now offers
@@ -270,6 +276,7 @@ class ProtocolLinkingMixin:
             replaceable = other is None and other_provider == protocol.provider_id
             if (
                 is_own
+                and not claimed
                 and other_role in OWN_PROTOCOL_ROLES
                 and not replaceable
                 and _native_rank(other_provider) == _native_rank(protocol.provider_id)
@@ -283,14 +290,16 @@ class ProtocolLinkingMixin:
         """
         Return the role a protocol is attached to a player in.
 
-        That is the role it reports, unless it stands for the device itself while another
-        protocol of the player that does so ranks above it (NATIVE_PRIORITY), attached or
-        away, and the user has that one switched on: then it is a control protocol of the
-        player.
+        That is the role it reports, unless the own protocol of the player claims it, or it
+        stands for the device itself while another protocol of the player that does so ranks
+        above it (NATIVE_PRIORITY), attached or away, and the user has that one switched on:
+        then it is a control protocol of the player.
 
         :param protocol: The protocol.
         :param player_id: Id of the player it is attached to.
         """
+        if self._is_claimed(protocol, player_id):
+            return ProtocolRole.CONTROL
         if protocol.role not in OWN_PROTOCOL_ROLES:
             return protocol.role
         rank = _native_rank(protocol.provider_id)
@@ -316,7 +325,9 @@ class ProtocolLinkingMixin:
 
         A protocol that stands for the device itself becomes a control protocol when a
         protocol that ranks above it arrives, and stands for it again once that one is
-        removed. The caller holds the attach lock.
+        removed; a protocol the own protocol claims becomes a claimed instance, and one it
+        claims no more attaches as what it is without the claim. The caller holds the attach
+        lock.
 
         :param player: The player.
         """
@@ -329,7 +340,88 @@ class ProtocolLinkingMixin:
                     protocol.protocol_id,
                     player.display_name,
                 )
+                if self._attached_as_claimed(player, protocol):
+                    # the claim ended, and with it the link to the player: it attaches
+                    # as what it is without the claim
+                    await self._unbind(protocol)
+                    player.remove_protocol(protocol.protocol_id, forget=True)
+                    self.mass.config.set_protocol_value(protocol.protocol_id, "player_id", None)
                 await self._run_attach(protocol)
+
+    def _is_claimed(self, protocol: PlayerProtocol, player_id: str) -> bool:
+        """
+        Return whether the own protocol of a player claims a protocol as an instance of its device.
+
+        The claims of the own protocol decide while it is attached. While it is away and the
+        user has it switched on, a protocol attached as claimed instance stays one.
+
+        :param protocol: The protocol.
+        :param player_id: Id of the player.
+        """
+        if (player := self._players.get(player_id)) is None:
+            return False
+        if (own := player.own_protocol) is not None:
+            return own is not protocol and not own.claimed_identifiers.isdisjoint(
+                protocol.identifiers
+            )
+        return self._attached_as_claimed(player, protocol) and self._claimer_switched_on(player_id)
+
+    def _waits_for_claimer(self, protocol: PlayerProtocol) -> bool:
+        """
+        Return whether a protocol waits for the own protocol of its player to say whether it claims it.
+
+        That is a protocol stored on a player that holds another protocol of its domain, other
+        than one attached as claimed instance, while the own protocol of that player is away and
+        the user has it switched on: only that protocol can tell which of them it claims.
+
+        :param protocol: The protocol that attaches.
+        """
+        if protocol.underlying_protocol_id or protocol.role in OWN_PROTOCOL_ROLES:
+            return False
+        record = self.mass.config.get_protocol_record(protocol.protocol_id) or {}
+        player = self._players.get(str(record.get("player_id")))
+        if player is None or player.own_protocol is not None:
+            return False
+        if not self._claimer_switched_on(player.player_id):
+            return False
+        domain = protocol.provider.domain
+        for other_id in self._get_protocol_ids(player.player_id) - {protocol.protocol_id}:
+            if other := self._protocols.get(other_id):
+                if self._attached_as_claimed(player, other):
+                    continue
+                other_domain = other.provider.domain
+            else:
+                other_record = self.mass.config.get_protocol_record(other_id) or {}
+                other_domain = str(other_record.get("provider") or "").split("--", maxsplit=1)[0]
+            if other_domain == domain:
+                return True
+        return False
+
+    def _attached_as_claimed(self, player: Player, protocol: PlayerProtocol) -> bool:
+        """
+        Return whether a protocol is attached to a player as a claimed instance.
+
+        :param player: The player.
+        :param protocol: The protocol.
+        """
+        return (
+            protocol.role not in OWN_PROTOCOL_ROLES
+            and player.get_role(protocol.protocol_id) == ProtocolRole.CONTROL
+        )
+
+    def _claimer_switched_on(self, player_id: str) -> bool:
+        """
+        Return whether a player has a protocol that stands for the device the user has switched on.
+
+        :param player_id: Id of the player.
+        """
+        for protocol_id in self._get_protocol_ids(player_id):
+            record = self.mass.config.get_protocol_record(protocol_id) or {}
+            if record.get(
+                "role"
+            ) in OWN_PROTOCOL_ROLES and self.mass.config.is_protocol_switched_on(protocol_id):
+                return True
+        return False
 
     def _get_replaced_protocol_id(self, protocol: PlayerProtocol, player_id: str) -> str | None:
         """
@@ -413,7 +505,10 @@ class ProtocolLinkingMixin:
         # Being offline doesn't make it a different device — it's still occupying
         # this domain slot. The provider should remove stale protocols explicitly.
         return any(
-            other.provider.domain == domain and other is not protocol
+            other.provider.domain == domain
+            and other is not protocol
+            # a claimed instance holds no place of its domain
+            and not self._attached_as_claimed(player, other)
             for other in player.protocols.values()
         )
 
@@ -447,7 +542,8 @@ class ProtocolLinkingMixin:
 
         An attached protocol reports its identifiers itself; for one that is away the
         identifiers it last reported were stored, without its address: that is handed out
-        again to another device while this one is away.
+        again to another device while this one is away. A claimed instance is another device:
+        what its claimer claims stands for it.
 
         :param player_id: Id of the player.
         :param exclude_protocol_id: Id of a protocol of the player to leave out.
@@ -455,11 +551,17 @@ class ProtocolLinkingMixin:
         """
         parts: list[DeviceIdentity] = []
         domains: set[str] = set()
+        player = self._players.get(player_id)
         for protocol_id in self._get_protocol_ids(player_id):
             if protocol_id == exclude_protocol_id:
                 continue
-            if protocol := self._protocols.get(protocol_id):
-                parts.append(self._identity_of(protocol))
+            # a protocol that is held, waiting for its place, counts like one that is away
+            if (protocol := self._protocols.get(protocol_id)) and protocol.player is not None:
+                if player is not None and self._attached_as_claimed(player, protocol):
+                    continue
+                parts.append(
+                    replace(self._identity_of(protocol), claims=protocol.claimed_identifiers)
+                )
                 domains.add(protocol.provider.domain)
                 continue
             stored = self.mass.config.get_protocol_record(protocol_id) or {}
@@ -516,6 +618,7 @@ class ProtocolLinkingMixin:
             identifiers=frozenset().union(*(part.identifiers for part in parts)),
             domains=frozenset().union(*(part.domains for part in parts)),
             native=any(part.native for part in parts),
+            claims=frozenset().union(*(part.claims for part in parts)),
         )
 
     def _check_merge(self, keep_id: str, absorb_id: str) -> None:
@@ -562,7 +665,9 @@ class ProtocolLinkingMixin:
             # of two protocols that stand for the device, one has to rank above the other
             msg = f"{names[0]} and {names[1]} each stand for a device of their own"
             return self._refused(msg, "merge_two_own_protocols", *names)
-        if shared := self._domains_of(keep_id) & self._domains_of(absorb_id):
+        # a protocol the own protocol of either claims is no second one of its domain
+        claims = self._claims_of(keep_id) | self._claims_of(absorb_id)
+        if shared := self._domains_of(keep_id, claims) & self._domains_of(absorb_id, claims):
             domain = min(shared)
             with suppress(KeyError):
                 domain = self.mass.get_provider_manifest(domain).name
@@ -624,19 +729,33 @@ class ProtocolLinkingMixin:
                 ranks.add(_native_rank(provider_id))
         return ranks
 
-    def _domains_of(self, player_id: str) -> set[str]:
+    def _domains_of(self, player_id: str, claims: frozenset[Identifier] = frozenset()) -> set[str]:
         """
         Return the domains of the protocols of a player, attached or not.
 
         :param player_id: Id of the player.
+        :param claims: Identifiers of claimed instances, whose protocols are left out.
         """
         domains: set[str] = set()
         for protocol_id in self._get_protocol_ids(player_id):
             if protocol := self._protocols.get(protocol_id):
-                domains.add(protocol.provider.domain)
+                if claims.isdisjoint(protocol.identifiers):
+                    domains.add(protocol.provider.domain)
             elif record := self.mass.config.get_protocol_record(protocol_id):
-                domains.add(str(record.get("provider") or "").split("--", maxsplit=1)[0])
+                stored = (record.get("values") or {}).get(CONF_PROTOCOL_IDENTIFIERS) or ()
+                if claims.isdisjoint((IdentifierType(kind), str(value)) for kind, value in stored):
+                    domains.add(str(record.get("provider") or "").split("--", maxsplit=1)[0])
         return domains
+
+    def _claims_of(self, player_id: str) -> frozenset[Identifier]:
+        """
+        Return what the attached own protocol of a player claims.
+
+        :param player_id: Id of the player.
+        """
+        player = self._players.get(player_id)
+        own = player.own_protocol if player else None
+        return own.claimed_identifiers if own else frozenset()
 
     def _stored_player_name(self, player_id: str) -> str:
         """
@@ -677,6 +796,17 @@ class ProtocolLinkingMixin:
         ):
             msg = f"{name} rides on another protocol and follows it"
             raise self._refused(msg, "unlink_derived", name)
+        stored = (record.get("values") or {}).get(CONF_PROTOCOL_IDENTIFIERS) or ()
+        if (
+            self._is_claimed(protocol, player_id)
+            if protocol is not None
+            else not self._claims_of(player_id).isdisjoint(
+                (IdentifierType(kind), str(value)) for kind, value in stored
+            )
+        ):
+            claimer = self._stored_player_name(player_id)
+            msg = f"{name} belongs to {claimer} and follows it"
+            raise self._refused(msg, "unlink_claimed", name, claimer)
         if (protocol.role if protocol else record.get("role")) == ProtocolRole.VIRTUAL:
             msg = f"{name} is the protocol of a group"
             raise self._refused(msg, "unlink_group", name)
@@ -830,6 +960,10 @@ class ProtocolLinkingMixin:
                 protocol.underlying_protocol_id,
             )
             return
+        if self._waits_for_claimer(protocol):
+            # attached as soon as the own protocol of its player is, however long that takes
+            self.logger.debug("Protocol %s waits for the protocol that may claim it", protocol_id)
+            return
         self.logger.debug("Protocol %s waits for the identifiers of its device", protocol_id)
         self._pending_protocol_evaluations[protocol_id] = self.mass.loop.call_later(
             IDENTITY_COLLECT_WINDOW,
@@ -945,7 +1079,7 @@ class ProtocolLinkingMixin:
         for key, value in (
             ("player_id", player_id),
             ("provider", protocol.provider_id),
-            ("role", self._attach_role(protocol, player_id).value),
+            ("role", self._stored_role(protocol, player_id).value),
             ("default_name", protocol.name or stored.get("default_name")),
         ):
             if stored.get(key) != value:
@@ -981,6 +1115,20 @@ class ProtocolLinkingMixin:
         ):
             if values.get(key) != value:
                 config.set(f"{CONF_PLAYER_PROTOCOLS}/{protocol_id}/values/{key}", value)
+
+    def _stored_role(self, protocol: PlayerProtocol, player_id: str) -> ProtocolRole:
+        """
+        Return the role stored for a protocol: the one it attaches in, as far as it stands for the device.
+
+        A claimed instance keeps the role it reports: what it is to its own device.
+
+        :param protocol: The protocol.
+        :param player_id: Id of the player it belongs to.
+        """
+        role = self._attach_role(protocol, player_id)
+        if role == ProtocolRole.CONTROL and protocol.role not in OWN_PROTOCOL_ROLES:
+            return protocol.role
+        return role
 
     def _take_over_protocol_record(
         self, replaced_id: str, protocol_id: str, player_id: str

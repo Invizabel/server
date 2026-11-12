@@ -283,14 +283,19 @@ class FakeProtocol(PlayerProtocol):
                     values = (
                         list(identifier) if isinstance(identifier, list | tuple) else [identifier]
                     )
-                    # a device info keeps one identifier per type today, so of several values
-                    # the server sees the last one; None (or no value) drops the identifier
-                    for one in values or [None]:
-                        self._attr_device_info.add_identifier(identifier_type, one)
+                    # of several values the first is the device's own, the others are claimed
+                    # devices; None (or no value) drops the identifier
+                    self._attr_device_info.add_identifier(identifier_type, (values or [None])[0])
                     if identifier:
                         self._device.identifiers[identifier_type] = identifier
                     else:
                         self._device.identifiers.pop(identifier_type, None)
+                self._attr_claimed_identifiers = frozenset(
+                    (identifier_type, one)
+                    for identifier_type, identifier in self._device.identifiers.items()
+                    if isinstance(identifier, list | tuple)
+                    for one in identifier[1:]
+                )
                 continue
             if not hasattr(self, f"_attr_{key}"):
                 msg = f"{type(self).__name__} reports no state named {key!r}"
@@ -345,8 +350,8 @@ class FakePlayerProvider(PlayerProvider):
             protocol of a device (AirPlay, Cast, DLNA, ...), ``"control"`` for control without
             an audio path (LinkPlay), ``"virtual"`` for a group (with ``type=PlayerType.GROUP``).
         :param identifiers: The device identifiers it reports (MAC, IP, UUID, ...); a list of
-            values reports several identifiers of one type, for a device that stands for
-            several (sub)devices.
+            values reports the first one and claims the devices of the others, for a device
+            that stands for several (sub)devices.
         :param session_only: Whether the protocol reports that it exists only while attached,
             like a browser session.
         :param state: Other reported state, as taken by Scenario.report().
@@ -537,7 +542,8 @@ class Scenario:
         :param state: Values by attribute name without the ``_attr_`` prefix (``available``,
             ``powered``, ``volume_level``, ``playback_state``, ``supported_features``, ...),
             plus ``identifiers`` (merged into the reported device info, a None value drops
-            one, a list of values reports several of one type). A role changes with attach().
+            one, a list of values reports its first value and claims the devices of the
+            others, see PlayerProtocol.claimed_identifiers). A role changes with attach().
         """
         self._check_current(protocol)
         if "role" in state:

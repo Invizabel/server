@@ -38,11 +38,13 @@ class DeviceIdentity:
         two MAC addresses or several UUIDs holds one pair per value.
     :param domains: The protocol domains that reported the identifiers.
     :param native: Whether the native protocol of the device is among them.
+    :param claims: Identifiers of further devices whose protocols belong to this side.
     """
 
     identifiers: frozenset[Identifier]
     domains: frozenset[str]
     native: bool
+    claims: frozenset[Identifier] = frozenset()
 
 
 def identifiers_match(a: DeviceIdentity, b: DeviceIdentity) -> bool:
@@ -50,7 +52,8 @@ def identifiers_match(a: DeviceIdentity, b: DeviceIdentity) -> bool:
     Return whether two identities stand for the same physical device.
 
     A differing strong identifier rules a match out first, and a side that reports no
-    zone is in the main zone of its chassis. After that any shared identifier is a match.
+    zone is in the main zone of its chassis. After that any shared identifier is a match,
+    a value one side claims included.
     A shared IP address alone is the last resort, and never ties two native devices that
     each have a hardware MAC address, as one host can carry several of them.
 
@@ -73,9 +76,9 @@ def matches_device(candidate: DeviceIdentity, parts: Iterable[DeviceIdentity]) -
     :param parts: What each protocol of a player reported about the device of that player.
     """
     parts = tuple(parts)
-    values = _with_missing(_comparable_values(candidate))
-    merged, same_domain = _merged_values(candidate, parts)
-    if _vetoed(values, _with_missing(merged), same_domain):
+    values = _comparable_values(candidate)
+    merged, same_domain = _merged_values(candidate, values, parts)
+    if _vetoed(_with_missing(values), _with_missing(merged), same_domain):
         return False
     for identifier_type, rule in _RULES.items():
         if rule.identifies and values[identifier_type] & merged[identifier_type]:
@@ -100,8 +103,9 @@ def vetoes_device(candidate: DeviceIdentity, parts: Iterable[DeviceIdentity]) ->
     :param candidate: What one protocol reports about its device.
     :param parts: What each protocol of a player reported about the device of that player.
     """
-    merged, same_domain = _merged_values(candidate, tuple(parts))
-    return _vetoed(_comparable_values(candidate), merged, same_domain)
+    values = _comparable_values(candidate)
+    merged, same_domain = _merged_values(candidate, values, tuple(parts))
+    return _vetoed(values, merged, same_domain)
 
 
 def has_hardware_mac(identity: DeviceIdentity) -> bool:
@@ -142,6 +146,9 @@ class _Rule(NamedTuple):
 # A MAC address never vetoes: a device has one per network interface, and some protocols
 # report a variant of it.
 # An IP address is no row: it ties two sides only as the last resort, see identifiers_match.
+# A value a side claims for a further device (DeviceIdentity.claims) takes part like its own
+# identifiers, and for a veto it counts in the domain of the side that holds it: it never
+# rules out the device it claims.
 _RULES: dict[IdentifierType, _Rule] = {
     IdentifierType.MAC_ADDRESS: _Rule(_Veto.NEVER, identifies=True),
     IdentifierType.SERIAL_NUMBER: _Rule(_Veto.SAME_DOMAIN, identifies=True),
@@ -153,9 +160,14 @@ _RULES: dict[IdentifierType, _Rule] = {
 
 
 def _comparable_values(identity: DeviceIdentity) -> defaultdict[IdentifierType, set[str]]:
-    """Return the values an identity holds per identifier type, as they are compared."""
+    """Return the values an identity holds per identifier type, its claims included."""
+    return _comparable(identity.identifiers | identity.claims)
+
+
+def _comparable(identifiers: Iterable[Identifier]) -> defaultdict[IdentifierType, set[str]]:
+    """Return the values of identifiers per identifier type, as they are compared."""
     values: defaultdict[IdentifierType, set[str]] = defaultdict(set)
-    for identifier_type, value in identity.identifiers:
+    for identifier_type, value in identifiers:
         if identifier_type == IdentifierType.MAC_ADDRESS:
             if not is_valid_mac_address(value):
                 # a null or broadcast MAC address identifies nothing
@@ -181,21 +193,31 @@ def _with_missing(
 
 
 def _merged_values(
-    candidate: DeviceIdentity, parts: tuple[DeviceIdentity, ...]
+    candidate: DeviceIdentity,
+    values: defaultdict[IdentifierType, set[str]],
+    parts: tuple[DeviceIdentity, ...],
 ) -> tuple[defaultdict[IdentifierType, set[str]], defaultdict[IdentifierType, set[str]]]:
     """
     Return the values several identities hold together, per identifier type.
 
-    Returns all of them, and the ones of the parts that share a domain with the candidate.
+    Returns all of them, and the ones that count in the domain of the candidate: those of
+    the parts that share a domain with it, and the claimed values it holds itself.
+
+    :param candidate: What one side reports about its device.
+    :param values: The comparable values of the candidate.
+    :param parts: What each protocol of the other side reported.
     """
     merged: defaultdict[IdentifierType, set[str]] = defaultdict(set)
     same_domain: defaultdict[IdentifierType, set[str]] = defaultdict(set)
     for part in parts:
         shares_domain = not candidate.domains.isdisjoint(part.domains)
-        for identifier_type, part_values in _comparable_values(part).items():
+        for identifier_type, part_values in _comparable(part.identifiers).items():
             merged[identifier_type] |= part_values
             if shares_domain:
                 same_domain[identifier_type] |= part_values
+        for identifier_type, claimed in _comparable(part.claims).items():
+            merged[identifier_type] |= claimed
+            same_domain[identifier_type] |= claimed & values[identifier_type]
     return merged, same_domain
 
 

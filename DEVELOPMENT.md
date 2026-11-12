@@ -190,6 +190,7 @@ A player provider implements one `PlayerProtocol` (`music_assistant/models/playe
 * `on_remove()` also reaches a protocol that is not attached, as long as its provider holds the object: the server keeps those only weakly, so a provider with a configured device list keeps the object of every device on it.
 * The config of a protocol has no name: the name the user gave the device is `self.player.config.name`.
 * Software players that share a host report an id of their own instance as `UUID` or `SERIAL_NUMBER` identifier.
+* A protocol that stands for further devices (a room of several speakers) reports their identifiers in `_attr_claimed_identifiers`: their protocols attach to its player as claimed instances, no outputs of their own. Attach the protocol again when its claims change.
 * A provider whose native protocol stands for devices of other makes (a Home Assistant media player) is ranked below the vendor's own protocol in `NATIVE_PRIORITY`: on a device that has both, it attaches as a control protocol of the vendor's player.
 * Every zone of a multi-zone chassis reports its zone as `ZONE` next to the identifiers of the chassis: `MAIN_ZONE` for the zone where the protocols of the chassis that report no zone (AirPlay, DLNA, ...) play, its own id for every other zone.
 

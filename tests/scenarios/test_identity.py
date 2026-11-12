@@ -1112,11 +1112,6 @@ async def test_a_role_change_neither_merges_nor_splits_players(scenario: Scenari
     assert scenario.events(EventType.PLAYER_ADDED, EventType.PLAYER_REMOVED) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="phase 2 (#416): a native protocol claims the further instances of one domain",
-)
 async def test_room_of_several_renderers_is_one_player(scenario: Scenario) -> None:
     """
     A native room standing for three DLNA renderers is one visible player with one DLNA output.
@@ -1185,6 +1180,383 @@ async def test_room_of_several_renderers_is_one_player(scenario: Scenario) -> No
     ]
     room_id = scenario.player_of(living)
     assert {scenario.player_of(renderer) for renderer in (connector, one_m, one_s)} == {room_id}
+
+
+class _Room(NamedTuple):
+    """A Raumfeld room and the DLNA renderers of its speakers, its own renderer first."""
+
+    room: FakeProtocol
+    connector: FakeProtocol
+    one_m: FakeProtocol
+    one_s: FakeProtocol
+
+
+ROOM_RENDERERS = (
+    (CONNECTOR_UDN, "Connector Living", "00:1E:C0:00:00:01", HOST_IP),
+    (ONE_M_UDN, "Speaker Living", "00:1E:C0:00:00:02", "192.168.1.81"),
+    (ONE_S_UDN, "Speaker Living", "00:1E:C0:00:00:03", "192.168.1.82"),
+)
+
+
+async def _room(scenario: Scenario) -> _Room:
+    """Create the room and its renderers; attach them to use them."""
+    dlna = await scenario.add_provider("dlna")
+    raumfeld = await scenario.add_provider("raumfeld")
+    renderers = [
+        dlna.protocol(
+            udn,
+            name,
+            role="audio",
+            identifiers={
+                IdentifierType.UUID: udn,
+                IdentifierType.MAC_ADDRESS: mac,
+                IdentifierType.IP_ADDRESS: ip,
+            },
+        )
+        for udn, name, mac, ip in ROOM_RENDERERS
+    ]
+    room = raumfeld.protocol(
+        "raumfeld_living",
+        "Living",
+        identifiers={
+            IdentifierType.UUID: [CONNECTOR_UDN, ONE_M_UDN, ONE_S_UDN],
+            IdentifierType.IP_ADDRESS: HOST_IP,
+        },
+    )
+    return _Room(room, *renderers)
+
+
+def _current_room(scenario: Scenario, room: _Room) -> _Room:
+    """Return the current protocol objects of a room, after a restart or a reload."""
+    return _Room(*(scenario.protocol(protocol.protocol_id) for protocol in room))
+
+
+def _one_room_player(scenario: Scenario, room: _Room) -> str:
+    """Return the one player of a room: its renderers claimed, the own one its DLNA output."""
+    assert scenario.visible_players() == [
+        VisiblePlayer(
+            player_id=ANY,
+            name="Living",
+            available=True,
+            powered=None,
+            provider="raumfeld",
+            outputs=(("dlna", True), ("raumfeld", True)),
+        )
+    ]
+    player_id = scenario.single_player(*room).player_id
+    assert _roles(scenario, player_id) == {
+        room.room.protocol_id: ProtocolRole.NATIVE,
+        room.connector.protocol_id: ProtocolRole.AUDIO,
+        room.one_m.protocol_id: ProtocolRole.CONTROL,
+        room.one_s.protocol_id: ProtocolRole.CONTROL,
+    }
+    return player_id
+
+
+@pytest.mark.parametrize(
+    "order",
+    list(itertools.permutations(("room", "connector", "one_m", "one_s"))),
+    ids="-".join,
+)
+async def test_a_room_and_its_renderers_are_one_player_in_every_order(
+    scenario: Scenario, order: tuple[str, ...]
+) -> None:
+    """
+    A room is one player with one DLNA output, whichever of its protocols is found first.
+
+    A renderer found before the room gets a player of its own, which nobody used yet and so
+    goes into the room's player once the room claims its renderer. After a restart every
+    protocol finds the same player again, in the reverse order: the renderers wait for the
+    room before they take their place.
+    """
+    room = await _room(scenario)
+    for part in order:
+        await scenario.attach(getattr(room, part))
+    await scenario.idle()
+    player_id = _one_room_player(scenario, room)
+    # a player for each renderer found before the room, and one for a room found before its
+    # own renderer; none more
+    created = order.index("room") + (order.index("connector") > order.index("room"))
+    assert len(scenario.events(EventType.PLAYER_ADDED)) == created
+
+    for protocol in room:
+        scenario.set_present(protocol.protocol_id, False)
+    await scenario.restart()
+    scenario.clear_events()
+    for part in reversed(order):
+        await scenario.attach(scenario.protocol(getattr(room, part).protocol_id))
+    await scenario.idle()
+
+    assert _one_room_player(scenario, _current_room(scenario, room)) == player_id
+    assert scenario.events(EventType.PLAYER_ADDED, EventType.PLAYER_REMOVED) == []
+
+
+@pytest.mark.parametrize("room_was", ["there", "away"])
+async def test_a_speaker_that_leaves_the_room_is_a_player_of_its_own(
+    scenario: Scenario, room_was: str
+) -> None:
+    """
+    A renderer the room claims no more becomes what it is without the claim, and joins again.
+
+    Its player of its own is unused, so it goes into the room's player again by itself once
+    the room claims the renderer again. The same when the speaker left while the room was
+    away.
+    """
+    room = await _room(scenario)
+    for protocol in room:
+        await scenario.attach(protocol)
+    player_id = _one_room_player(scenario, room)
+
+    if room_was == "away":
+        await scenario.detach(room.room)
+    await scenario.report(room.room, identifiers={IdentifierType.UUID: [CONNECTOR_UDN, ONE_M_UDN]})
+    await scenario.attach(room.room)
+    await scenario.idle()
+
+    assert scenario.player_of(room.one_s) not in (None, player_id)
+    assert _roles(scenario, player_id)[room.one_m.protocol_id] == ProtocolRole.CONTROL
+    assert len(scenario.visible_players()) == 2
+
+    await scenario.report(
+        room.room, identifiers={IdentifierType.UUID: [CONNECTOR_UDN, ONE_M_UDN, ONE_S_UDN]}
+    )
+    await scenario.attach(room.room)
+    await scenario.idle()
+
+    assert _one_room_player(scenario, room) == player_id
+
+
+@pytest.mark.parametrize("gone", ["away", "disabled"])
+async def test_a_room_away_or_disabled_keeps_its_renderers(scenario: Scenario, gone: str) -> None:
+    """
+    The renderers stay claimed while the room is away, and come back with a disabled player.
+
+    While the room is away its own renderer still plays; the claimed ones stay hidden.
+    """
+    room = await _room(scenario)
+    for protocol in room:
+        await scenario.attach(protocol)
+    player_id = _one_room_player(scenario, room)
+
+    if gone == "away":
+        await scenario.detach(room.room)
+        # the room's own renderer comes back meanwhile
+        await scenario.detach(room.connector)
+        await scenario.attach(room.connector)
+        assert [p.outputs for p in scenario.visible_players()] == [
+            (("dlna", True), ("raumfeld", False))
+        ]
+        assert _roles(scenario, player_id)[room.one_s.protocol_id] == ProtocolRole.CONTROL
+        await scenario.attach(room.room)
+    else:
+        await scenario.disable(player_id)
+        await scenario.enable(player_id)
+    await scenario.idle()
+
+    assert _one_room_player(scenario, _current_room(scenario, room)) == player_id
+
+
+async def test_renderers_found_without_their_room_wait_for_it(scenario: Scenario) -> None:
+    """
+    After a restart the renderers of a room wait for the room, however long that takes.
+
+    Only the room tells which of them it claims, so none gets a player of its own meanwhile.
+    """
+    room = await _room(scenario)
+    for protocol in room:
+        await scenario.attach(protocol)
+    player_id = _one_room_player(scenario, room)
+    for protocol in room:
+        scenario.set_present(protocol.protocol_id, False)
+    await scenario.restart()
+    scenario.clear_events()
+
+    room = _current_room(scenario, room)
+    for renderer in room[1:]:
+        await scenario.attach(renderer)
+    # they wait without a deadline
+    await scenario.idle()
+    await scenario.advance(60)
+    await scenario.idle()
+
+    assert [(p.player_id, p.available) for p in scenario.visible_players()] == [(player_id, False)]
+    await scenario.attach(room.room)
+    await scenario.idle()
+    assert _one_room_player(scenario, room) == player_id
+    assert scenario.events(EventType.PLAYER_ADDED, EventType.PLAYER_REMOVED) == []
+
+
+async def test_the_renderers_of_a_room_whose_provider_is_disabled_stand_on_their_own(
+    scenario: Scenario,
+) -> None:
+    """
+    While the user has the room's provider disabled, its renderers are what they are without it.
+
+    Enabled again, the room claims them again: their players nobody used go into the room's
+    player by themselves.
+    """
+    room = await _room(scenario)
+    for protocol in room:
+        await scenario.attach(protocol)
+    player_id = _one_room_player(scenario, room)
+    raumfeld = scenario.provider("raumfeld")
+
+    await scenario.mass.config.save_provider_config(
+        "raumfeld", {"enabled": False}, instance_id=raumfeld.instance_id
+    )
+    await scenario.idle()
+
+    renderers = [scenario.protocol(renderer.protocol_id) for renderer in room[1:]]
+    assert scenario.player_of(renderers[0]) == player_id
+    assert len({scenario.player_of(renderer) for renderer in renderers}) == 3
+
+    await scenario.mass.config.save_provider_config(
+        "raumfeld", {"enabled": True}, instance_id=raumfeld.instance_id
+    )
+    await scenario.idle()
+
+    assert _one_room_player(scenario, _current_room(scenario, room)) == player_id
+
+
+async def test_the_dlna_output_of_a_room_is_its_own_renderer_also_while_it_is_away(
+    scenario: Scenario,
+) -> None:
+    """While the room's own renderer is away, the DLNA output of the player is still its one."""
+    dlna = await scenario.add_provider("dlna")
+    raumfeld = await scenario.add_provider("raumfeld")
+    # the claimed renderer's id sorts before the id of the room's own renderer
+    own, claimed = (
+        dlna.protocol(
+            udn,
+            "Speaker Den",
+            role="audio",
+            identifiers={IdentifierType.UUID: udn, IdentifierType.MAC_ADDRESS: mac},
+        )
+        for udn, mac in (
+            ("uuid:zz-own", "00:1E:C0:00:00:21"),
+            ("uuid:aa-other", "00:1E:C0:00:00:22"),
+        )
+    )
+    room = raumfeld.protocol(
+        "raumfeld_den", "Den", identifiers={IdentifierType.UUID: ["uuid:zz-own", "uuid:aa-other"]}
+    )
+    for protocol in (room, own, claimed):
+        await scenario.attach(protocol)
+    player_id = scenario.single_player(room, own, claimed).player_id
+
+    await scenario.detach(own)
+
+    state = scenario.player(player_id)
+    assert state is not None
+    assert [(o.output_protocol_id, o.available) for o in state.output_protocols] == [
+        ("native", True),
+        ("uuid:zz-own", False),
+    ]
+
+
+@pytest.mark.parametrize("removed", ["renderer", "room", "player"])
+async def test_a_removed_part_of_a_room(scenario: Scenario, removed: str) -> None:
+    """
+    A removed renderer, room protocol or room player leaves what the claim says.
+
+    A renderer the provider forgets is claimed again when found again; without the room's own
+    protocol its renderers are players of their own; a removed room player is found again.
+    """
+    room = await _room(scenario)
+    for protocol in room:
+        await scenario.attach(protocol)
+    player_id = _one_room_player(scenario, room)
+
+    if removed == "renderer":
+        await scenario.mass.players.remove_protocol(room.one_s.protocol_id)
+        await scenario.attach(room.one_s)
+        await scenario.idle()
+        assert _one_room_player(scenario, room) == player_id
+    elif removed == "room":
+        scenario.set_present(room.room.protocol_id, False)
+        await scenario.mass.players.remove_protocol(room.room.protocol_id)
+        await scenario.idle()
+        assert scenario.player_of(room.connector) == player_id
+        assert len({scenario.player_of(renderer) for renderer in room[1:]}) == 3
+    else:
+        await scenario.remove(player_id)
+        await scenario.idle()
+        assert _one_room_player(scenario, _current_room(scenario, room)) != player_id
+
+
+async def test_a_renderer_player_that_was_used_stays_until_merged_by_hand(
+    scenario: Scenario,
+) -> None:
+    """
+    A renderer's player of its own that played stays when the room claims the renderer.
+
+    Merged by hand into the room's player, the renderer is a claimed instance of it.
+    """
+    room = await _room(scenario)
+    for renderer in room[1:]:
+        await scenario.attach(renderer)
+    one_s_id = scenario.single_player(room.one_s).player_id
+    await scenario.play(one_s_id)
+    await scenario.mass.player_queues.stop(one_s_id)
+    await scenario.idle()
+
+    await scenario.attach(room.room)
+    await scenario.idle()
+
+    room_id = scenario.player_of(room.room)
+    assert scenario.player_of(room.one_m) == room_id
+    assert scenario.player_of(room.one_s) == one_s_id
+
+    await scenario.mass.players.merge(one_s_id, str(room_id))
+    await scenario.idle()
+
+    assert _one_room_player(scenario, room) == room_id
+
+
+async def test_a_claimed_renderer_is_shown_as_a_control_of_the_room(scenario: Scenario) -> None:
+    """
+    A claimed renderer is listed among the protocols of the room's player, as control only.
+
+    It is no output and no volume or mute control of the player, and it can not be unlinked:
+    it follows the room, as a bridge follows the protocol it rides on.
+    """
+    room = await _room(scenario)
+    for protocol in room:
+        await scenario.attach(protocol)
+    player_id = _one_room_player(scenario, room)
+
+    state = scenario.player(player_id)
+    assert state is not None
+    assert [output.output_protocol_id for output in state.output_protocols] == [
+        "native",
+        CONNECTOR_UDN,
+    ]
+    # while the room's own renderer is away, its row stands for the DLNA output
+    await scenario.detach(room.connector)
+    state = scenario.player(player_id)
+    assert state is not None
+    assert [(o.output_protocol_id, o.available) for o in state.output_protocols] == [
+        ("native", True),
+        (CONNECTOR_UDN, False),
+    ]
+    await scenario.attach(room.connector)
+    entries = await scenario.mass.config.get_player_config_entries(player_id)
+    options = {
+        str(option.value)
+        for entry in entries
+        if entry.key in ("volume_control", "mute_control")
+        for option in entry.options
+    }
+    assert options.isdisjoint({ONE_M_UDN, ONE_S_UDN})
+    with pytest.raises(InvalidCommand):
+        await scenario.mass.players.unlink_protocol(ONE_S_UDN)
+
+    # with every renderer away, the player still offers one DLNA output
+    for renderer in room[1:]:
+        await scenario.detach(renderer)
+    assert [p.outputs for p in scenario.visible_players()] == [
+        (("dlna", False), ("raumfeld", True))
+    ]
 
 
 async def test_reflashed_device_keeps_its_player(scenario: Scenario) -> None:

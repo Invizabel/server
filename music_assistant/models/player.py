@@ -1059,14 +1059,19 @@ class Player:
                 )
             )
 
-        # Add the protocols that are not attached
-        for protocol_id in self._protocol_ids - listed_ids:
+        # Add the protocols that are not attached, one per domain: the claimed instances of
+        # a domain are no outputs of their own
+        listed_domains = {output.protocol_domain for output in result}
+        for protocol_id in sorted(self._protocol_ids - listed_ids - self._protocols.keys()):
             if not (stored := self.mass.config.get_protocol_record(protocol_id)) or stored.get(
                 "role"
             ) not in (ProtocolRole.NATIVE, ProtocolRole.AUDIO):
                 continue
             provider_id = stored.get("provider") or ""
             protocol_domain = provider_id.split("--")[0] if provider_id else "unknown"
+            if protocol_domain in listed_domains:
+                continue
+            listed_domains.add(protocol_domain)
             is_native = stored.get("role") == ProtocolRole.NATIVE
             # resolve the persisted derived-transport edge (if any) so derived
             # outputs keep their base reference even while not attached

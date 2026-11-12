@@ -2912,6 +2912,10 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                 )
             ):
                 player_id = replaced_player.player_id
+        if player_id is None and self._waits_for_claimer(protocol):
+            if not held:
+                self._hold_protocol(protocol)
+            return
         if player_id is None:
             player_id = self._resolve_player_id(protocol)
         if player_id is None:
@@ -2989,6 +2993,9 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
             player_id,
             player.display_name,
         )
+        if player.own_protocol is protocol:
+            # what it claims is known now
+            await self._attach_in_changed_roles(player)
         self._schedule_held_protocols()
         self._schedule_duplicate_merge(player_id)
 
@@ -3047,6 +3054,9 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
             return
         self._store_protocol(protocol, player.player_id)
         player.refresh_state()
+        if player.own_protocol is protocol:
+            # what it claims may have changed
+            await self._attach_in_changed_roles(player)
         self._schedule_held_protocols()
         self._schedule_duplicate_merge(player.player_id)
 
