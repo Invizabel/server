@@ -2261,20 +2261,31 @@ async def test_single_item_handler_keeps_crossfade_for_a_buffered_item() -> None
 
 
 @pytest.mark.parametrize(
-    ("is_realtime", "profile"),
-    [(False, PacingProfile.DEFAULT), (True, PacingProfile.NEAR_REALTIME)],
-    ids=["default", "realtime"],
+    ("is_realtime", "provider_domain", "profile"),
+    [
+        (False, "sonos", PacingProfile.REALTIME),
+        (True, "sonos", PacingProfile.REALTIME),
+        (False, "musiccast", PacingProfile.GAPLESS_BURST),
+        (True, "musiccast", PacingProfile.REALTIME),
+    ],
+    ids=["buffered", "realtime", "gapless-burst-buffered", "gapless-burst-realtime"],
 )
-async def test_single_item_handler_paces_by_source(
+async def test_single_item_handler_paces_by_player_and_source(
     monkeypatch: pytest.MonkeyPatch,
     is_realtime: bool,
+    provider_domain: str,
     profile: PacingProfile,
 ) -> None:
-    """A buffered item gets the default; a source that feeds just-in-time a gentler pace."""
+    """
+    A single track gets the realtime pace, whatever its source.
+
+    Only a buffered track for a player that holds a whole opening chunk before it plays
+    gapless gets that chunk up front; a just-in-time source could not deliver it anyway.
+    """
     controller, request, seen = _single_item_handler(
         is_realtime=is_realtime,
         capture_ffmpeg=monkeypatch,
-        player_provider_domain="sonos",
+        player_provider_domain=provider_domain,
     )
 
     with pytest.raises(_FfmpegArgsCaptured):
@@ -2402,7 +2413,7 @@ async def test_flow_is_always_paced_close_to_playback(
     with pytest.raises(_FfmpegArgsCaptured):
         await controller.serve_queue_flow_stream(request)
 
-    assert seen["extra_input_args"] == output_pacing_args(PacingProfile.NEAR_REALTIME)
+    assert seen["extra_input_args"] == output_pacing_args()
 
 
 async def test_flow_passes_on_encoded_audio_without_waiting_for_a_full_chunk(
