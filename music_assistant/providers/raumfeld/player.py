@@ -318,6 +318,8 @@ class RaumfeldPlayer(PlayerProtocol):
         # DLNA provider ignores, so they can no longer be linked to this room.
         if renderer_ip:
             self._attr_device_info.add_identifier(IdentifierType.IP_ADDRESS, renderer_ip)
+        # the renderers of the room's other speakers belong to the room's player
+        self._attr_claimed_identifiers = provider.room_claimed_renderers(room)
         self._attr_supported_features = {
             PlayerFeature.PLAY_MEDIA,
             PlayerFeature.VOLUME_SET,
@@ -417,6 +419,17 @@ class RaumfeldPlayer(PlayerProtocol):
         self.room = room
         self._attr_name = room
         self.update_state()
+
+    def set_claimed_renderers(self, claims: frozenset[tuple[IdentifierType, str]]) -> bool:
+        """
+        Claim the renderers of the room's other speakers; return whether they changed.
+
+        :param claims: The UUIDs of those renderers.
+        """
+        if claims == self._attr_claimed_identifiers:
+            return False
+        self._attr_claimed_identifiers = claims
+        return True
 
     def set_software_version(self, version: str | None) -> None:
         """

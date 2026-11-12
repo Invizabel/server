@@ -65,17 +65,28 @@ async def _raumfeld(scenario: Scenario) -> RaumfeldPlayerProvider:
 
 
 async def _sync(
-    scenario: Scenario, provider: RaumfeldPlayerProvider, rooms: dict[str, _Speaker]
+    scenario: Scenario,
+    provider: RaumfeldPlayerProvider,
+    rooms: dict[str, _Speaker],
+    other_renderers: dict[str, tuple[str, ...]] | None = None,
 ) -> None:
     """
     Have the host list the given rooms, and the provider sync its rooms with it.
 
     :param rooms: The speaker of each room the host lists, by room name.
+    :param other_renderers: The renderers of the other speakers of a room, by room name.
     """
     provider.host = RaumfeldHost(MagicMock(), f"http://{HOST_IP}:47365")
     provider.host._zone_config = ZoneConfig(
         rooms={
-            name: Room(name, speaker.room_udn, speaker.renderer_udn, "ACTIVE", False)
+            name: Room(
+                name,
+                speaker.room_udn,
+                speaker.renderer_udn,
+                "ACTIVE",
+                False,
+                (speaker.renderer_udn, *(other_renderers or {}).get(name, ())),
+            )
             for name, speaker in rooms.items()
         },
         zones={},
@@ -311,8 +322,7 @@ async def test_the_dlna_renderer_of_a_rooms_speaker_is_an_output_of_its_room(
     """
     The DLNA renderer of a room's speaker joins the room's player; another renderer does not.
 
-    A room reports the UUID of its own renderer only: the renderer of a second speaker in
-    the room stays a player of its own.
+    A renderer of a speaker the host does not list in the room stays a player of its own.
     """
     provider = await _raumfeld(scenario)
     dlna = await scenario.add_provider("dlna")
@@ -345,3 +355,57 @@ async def test_the_dlna_renderer_of_a_rooms_speaker_is_an_output_of_its_room(
     room_player = _player(_attached(provider, BAR)).player_id
     assert scenario.player_of(own) == room_player
     assert scenario.player_of(second) not in (None, room_player)
+
+
+@pytest.mark.parametrize("own_renderer", ["there", "away"])
+async def test_the_renderer_of_another_speaker_of_the_room_belongs_to_its_player(
+    scenario: Scenario, own_renderer: str
+) -> None:
+    """
+    The renderer of a second speaker of the room attaches to the room's player as a claimed one.
+
+    It is no output of the player. Once the speaker leaves the room, the renderer is a player of
+    its own, also when the room's own renderer is away and leaves its DLNA place free.
+    """
+    provider = await _raumfeld(scenario)
+    dlna = await scenario.add_provider("dlna")
+    await _sync(scenario, provider, {"Bar": BAR_SPEAKER}, {"Bar": ("uuid:renderer-bar-2",)})
+    own = dlna.protocol(
+        BAR_SPEAKER.renderer_udn,
+        "Speaker Bar",
+        role="audio",
+        identifiers={
+            IdentifierType.UUID: "renderer-bar",
+            IdentifierType.IP_ADDRESS: BAR_SPEAKER.ip_address,
+            IdentifierType.MAC_ADDRESS: "00:1e:c0:00:00:01",
+        },
+    )
+    second = dlna.protocol(
+        "uuid:renderer-bar-2",
+        "Speaker Bar 2",
+        role="audio",
+        identifiers={
+            IdentifierType.UUID: "renderer-bar-2",
+            IdentifierType.IP_ADDRESS: "192.168.1.43",
+            IdentifierType.MAC_ADDRESS: "00:1e:c0:00:00:02",
+        },
+    )
+
+    await scenario.attach(second)
+    await scenario.attach(own)
+    await scenario.idle()
+
+    room_player = _player(_attached(provider, BAR))
+    assert {scenario.player_of(own), scenario.player_of(second)} == {room_player.player_id}
+    assert room_player.get_role(second.protocol_id) == ProtocolRole.CONTROL
+    assert sorted(output.protocol_domain for output in room_player.output_protocols) == [
+        "dlna",
+        "raumfeld",
+    ]
+
+    if own_renderer == "away":
+        await scenario.detach(own)
+    await _sync(scenario, provider, {"Bar": BAR_SPEAKER})
+    await scenario.idle()
+
+    assert scenario.player_of(second) not in (None, room_player.player_id)

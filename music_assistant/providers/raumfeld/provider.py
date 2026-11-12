@@ -26,6 +26,7 @@ from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from async_upnp_client.exceptions import UpnpError
+from music_assistant_models.enums import IdentifierType
 
 from music_assistant.constants import (
     CONF_ENABLE_ICY_METADATA,
@@ -290,6 +291,19 @@ class RaumfeldPlayerProvider(PlayerProvider):
         if (renderer_udn := self.host.renderer_udn(room)) is None:
             return None
         return self.host.location(renderer_udn)
+
+    def room_claimed_renderers(self, room: str) -> frozenset[tuple[IdentifierType, str]]:
+        """
+        Return the UUIDs of the renderers of a room other than its own one.
+
+        The room claims them: they belong to its player, not to players of their own.
+
+        :param room: The Raumfeld room name to look up.
+        """
+        return frozenset(
+            (IdentifierType.UUID, udn.removeprefix("uuid:"))
+            for udn in self.host.renderer_udns(room)[1:]
+        )
 
     def resolve_room_renderer(self, room: str) -> tuple[str | None, str | None]:
         """
@@ -645,6 +659,10 @@ class RaumfeldPlayerProvider(PlayerProvider):
                         existing.set_room(room)
                         existing.set_software_version(self.room_software_version(room))
                         existing.set_available(True)
+                        if existing.set_claimed_renderers(self.room_claimed_renderers(room)):
+                            # a speaker joined or left the room: attached again, the room
+                            # takes it in or lets it go
+                            await self.mass.players.attach(existing)
                     self._ensure_icy_default(protocol_id)
                     continue
                 if not self.mass.players.wants_protocol(protocol_id):

@@ -40,6 +40,8 @@ class Room:
     renderer_udn: str | None
     power_state: str | None
     spotify_active: bool
+    # every renderer of the room, its own one first
+    renderer_udns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,14 @@ class RaumfeldHost:
         :param room: The room name.
         """
         return info.renderer_udn if (info := self._zone_config.rooms.get(room)) else None
+
+    def renderer_udns(self, room: str) -> tuple[str, ...]:
+        """
+        Return the UDNs of every renderer of a room, its own one first.
+
+        :param room: The room name.
+        """
+        return info.renderer_udns if (info := self._zone_config.rooms.get(room)) else ()
 
     def power_state(self, room: str) -> str | None:
         """
@@ -308,4 +318,9 @@ def _room(element: Element) -> Room | None:
         renderer_udn=renderer.get("udn") if renderer is not None else None,
         power_state=element.get("powerState"),
         spotify_active=renderer is not None and renderer.get("spotifyConnect") == _SPOTIFY_ACTIVE,
+        renderer_udns=tuple(
+            renderer_udn
+            for element_renderer in element.iterfind("renderer")
+            if (renderer_udn := element_renderer.get("udn"))
+        ),
     )

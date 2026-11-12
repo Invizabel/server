@@ -371,6 +371,9 @@ def _host_room_player() -> RaumfeldPlayer:
         return_value=("5065835a-d69f-4a1b-8c2d-5065835ad69f", "192.168.1.41")
     )
     provider.line_in = MagicMock(return_value=None)  # type: ignore[attr-defined]
+    provider.room_claimed_renderers = MagicMock(  # type: ignore[attr-defined]
+        return_value=frozenset({(IdentifierType.UUID, "renderer-sub")})
+    )
     provider.room_model = MagicMock(  # type: ignore[attr-defined]
         return_value="Raumfeld Soundbar"
     )
@@ -389,6 +392,7 @@ def test_room_on_the_host_gets_its_ip_identifier() -> None:
     """The room whose renderer runs on the host gets its IP, so its other outputs link to it."""
     player = _host_room_player()
     assert player.device_info.identifiers[IdentifierType.IP_ADDRESS] == "192.168.1.41"
+    assert player.claimed_identifiers == {(IdentifierType.UUID, "renderer-sub")}
     assert player.device_info.model == "Raumfeld Soundbar"
     assert player.device_info.software_version == "2.21.0"
     assert player.powered is False
